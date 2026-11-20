@@ -178,6 +178,13 @@ def parse_csv(text: str) -> list[ReportRow]:
 
 
 # ---------------------------------------------------------------- 图与桥接
+#
+# 密集路段（如 3000 节点两两相连的团）会产生 O(V^2) 条边，若把邻接关系物化成
+# Python set，仅边对象就可达数 GB，256 MiB 内存上限下必然 OOM。这里改为：
+# 1) 5 米空间哈希网格，邻居只可能落在本格及相邻 8 格，按需枚举、绝不存边（O(V) 内存）；
+# 2) 单趟迭代式 Tarjan 求割点（无递归深度问题），并在 DFS 树上直接记录
+#    low[child] >= disc[ap] 的孩子，分裂组由这些孩子的子树 + 祖先方向剩余节点组成，
+#    无需为每个割点重新 BFS。
 
 
 def connected(a, b) -> bool:
@@ -187,122 +194,145 @@ def connected(a, b) -> bool:
     return d <= MAX_DISTANCE_M and dt <= MAX_TIME_DIFF_S
 
 
-def build_adjacency(reports) -> dict[str, set[str]]:
-    ids = [r["report_id"] for r in reports]
-    adj: dict[str, set[str]] = {rid: set() for rid in ids}
+_GRID_CELL = MAX_DISTANCE_M  # 格宽 = 距离阈值；相距 <=5m 的两点格号至多相差 1
+_DISTANCE_SQ_LIMIT = MAX_DISTANCE_M * MAX_DISTANCE_M
+
+
+def _build_grid(reports) -> dict[tuple[int, int], list[int]]:
+    """空间哈希网格：格号 -> 节点下标列表。"""
+    grid: dict[tuple[int, int], list[int]] = {}
+    for i, r in enumerate(reports):
+        key = (math.floor(r["x"] / _GRID_CELL), math.floor(r["y"] / _GRID_CELL))
+        grid.setdefault(key, []).append(i)
+    return grid
+
+
+def _iter_neighbors(u: int, reports, grid: dict[tuple[int, int], list[int]]):
+    """按需枚举节点 u 的全部邻居（生成器，不保存边）。
+
+    距离 <=5m 的节点只能落在本格及周围 8 格；时差与距离在枚举时内联判定，
+    避免每条候选边一次函数调用开销。每个 v 只属于一个格子，因此不会重复产出。
+    """
+    ru = reports[u]
+    xu, yu, tu = ru["x"], ru["y"], ru["ts_epoch"]
+    cx = math.floor(xu / _GRID_CELL)
+    cy = math.floor(yu / _GRID_CELL)
+    for gx in (cx - 1, cx, cx + 1):
+        for gy in (cy - 1, cy, cy + 1):
+            cell = grid.get((gx, gy))
+            if cell is None:
+                continue
+            for v in cell:
+                if v == u:
+                    continue
+                rv = reports[v]
+                dt = tu - rv["ts_epoch"]
+                if dt < -MAX_TIME_DIFF_S or dt > MAX_TIME_DIFF_S:
+                    continue
+                dx = xu - rv["x"]
+                dy = yu - rv["y"]
+                if dx * dx + dy * dy <= _DISTANCE_SQ_LIMIT:
+                    yield v
+
+
+def _collect_subtree(root: int, children: list[list[int]]) -> list[int]:
+    """收集 DFS 树上 root 子树的全部节点下标。"""
+    out: list[int] = []
+    stack = [root]
+    while stack:
+        u = stack.pop()
+        out.append(u)
+        stack.extend(children[u])
+    return out
+
+
+def find_bridges(reports) -> list[dict]:
+    """找出疑似桥接上报（割点），内存占用 O(V)，可处理密集大图。
+
+    输入：同一路段、未撤回的有效上报，元素为含 report_id/x/y/ts_epoch 的映射。
+    输出：[{"report_id": ..., "groups": [[上报号...], ...]}]，按上报号排序；
+    仅包含“移除后原连通组分裂成至少两个非空组”的上报，并给出分裂后各组名单
+    （分裂组只统计其原连通组，其他不相干连通组不计入，叶子点因此不会被误判）。
+    """
     n = len(reports)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if connected(reports[i], reports[j]):
-                a, b = reports[i]["report_id"], reports[j]["report_id"]
-                adj[a].add(b)
-                adj[b].add(a)
-    return adj
+    if n < 3:  # 少于 3 个节点，移除任一节点都不可能留下两个非空组
+        return []
 
-
-def _articulation_points(ids: list[str], adj: dict[str, set[str]]) -> set[str]:
-    """Tarjan 割点算法（迭代实现，避免递归深度限制）。"""
-    disc: dict[str, int] = {}
-    low: dict[str, int] = {}
-    parent: dict[str, str | None] = {}
-    aps: set[str] = set()
+    grid = _build_grid(reports)
+    disc = [-1] * n
+    low = [0] * n
+    parent = [-1] * n
+    children: list[list[int]] = [[] for _ in range(n)]  # 仅 DFS 树边，总计 O(V)
+    comp_id = [-1] * n
+    comp_nodes: list[list[int]] = []
     timer = 0
-    for s in ids:
-        if s in disc:
+    aps: set[int] = set()
+    # 割点 -> 使 low[child] >= disc[ap] 成立的树孩子（DFS 根则取其全部树孩子）
+    ap_children: dict[int, list[int]] = {}
+
+    for start in range(n):
+        if disc[start] != -1:
             continue
-        parent[s] = None
-        disc[s] = low[s] = timer
+        cid = len(comp_nodes)
+        members: list[int] = []
+        disc[start] = low[start] = timer
         timer += 1
+        comp_id[start] = cid
+        members.append(start)
         root_children = 0
-        stack = [(s, iter(adj[s]))]
+        stack = [(start, _iter_neighbors(start, reports, grid))]
         while stack:
-            v, it = stack[-1]
+            u, it = stack[-1]
             descended = False
-            for w in it:
-                if w not in disc:
-                    parent[w] = v
-                    disc[w] = low[w] = timer
+            for v in it:
+                if disc[v] == -1:
+                    parent[v] = u
+                    children[u].append(v)
+                    disc[v] = low[v] = timer
                     timer += 1
-                    if parent[v] is None:
+                    comp_id[v] = cid
+                    members.append(v)
+                    if parent[u] == -1:
                         root_children += 1
-                    stack.append((w, iter(adj[w])))
+                    stack.append((v, _iter_neighbors(v, reports, grid)))
                     descended = True
                     break
-                if w != parent[v]:
-                    low[v] = min(low[v], disc[w])
+                if v != parent[u] and disc[v] < low[u]:
+                    low[u] = disc[v]  # 回边（无向图忽略指向父亲的边）
             if descended:
                 continue
             stack.pop()
             if stack:
                 p = stack[-1][0]
-                low[p] = min(low[p], low[v])
-                if parent[p] is not None and low[v] >= disc[p]:
+                if low[u] < low[p]:
+                    low[p] = low[u]
+                if parent[p] != -1 and low[u] >= disc[p]:
                     aps.add(p)
-        if root_children > 1:
-            aps.add(s)
-    return aps
+                    ap_children.setdefault(p, []).append(u)
+        comp_nodes.append(members)
+        if root_children > 1:  # DFS 根：树孩子 >1 才是割点，每个孩子子树各成一组
+            aps.add(start)
+            ap_children[start] = children[start]
 
-
-def _components(ids: list[str], adj: dict[str, set[str]]) -> list[list[str]]:
-    seen: set[str] = set()
-    comps: list[list[str]] = []
-    for rid in ids:
-        if rid in seen:
-            continue
-        comp = []
-        stack = [rid]
-        seen.add(rid)
-        while stack:
-            u = stack.pop()
-            comp.append(u)
-            for w in adj[u]:
-                if w not in seen:
-                    seen.add(w)
-                    stack.append(w)
-        comps.append(comp)
-    return comps
-
-
-def _split_groups(members: list[str], adj: dict[str, set[str]], removed: str) -> list[list[str]]:
-    """在 removed 所属的连通组内移除它，求剩余节点的分组（组内上报号排序）。"""
-    seen = {removed}
-    groups: list[list[str]] = []
-    for rid in members:
-        if rid in seen:
-            continue
-        comp = []
-        stack = [rid]
-        seen.add(rid)
-        while stack:
-            u = stack.pop()
-            comp.append(u)
-            for w in adj[u]:
-                if w not in seen:
-                    seen.add(w)
-                    stack.append(w)
-        groups.append(sorted(comp))
-    groups.sort()
-    return groups
-
-
-def find_bridges(reports) -> list[dict]:
-    """找出疑似桥接上报。
-
-    输入：同一路段、未撤回的有效上报，元素为含 report_id/x/y/ts_epoch 的映射。
-    输出：[{"report_id": ..., "groups": [[上报号...], ...]}]，按上报号排序；
-    仅包含“移除后原连通组分裂成至少两个非空组”的上报，并给出分裂后各组名单。
-    """
-    ids = [r["report_id"] for r in reports]
-    adj = build_adjacency(reports)
-    comp_of: dict[str, list[str]] = {}
-    for comp in _components(ids, adj):
-        for rid in comp:
-            comp_of[rid] = comp
-    result = []
-    for ap in sorted(_articulation_points(ids, adj)):
-        # 只统计“原连通组”的分裂；图中其他不相干连通组不算在内，
-        # 否则叶子点会被误判成桥接
-        groups = _split_groups(comp_of[ap], adj, ap)
+    marker = [-1] * n  # 标记已归入某割点分裂组的节点，O(V) 复用，无需每次建集合
+    result: list[dict] = []
+    for ap in sorted(aps, key=lambda i: reports[i]["report_id"]):
+        groups: list[list[str]] = []
+        for c in ap_children[ap]:
+            subtree = _collect_subtree(c, children)
+            for u in subtree:
+                marker[u] = ap
+            groups.append(sorted(reports[u]["report_id"] for u in subtree))
+        if parent[ap] != -1:
+            # 非根割点：祖先方向（含经由回边仍与祖先连通的兄弟子树）剩余节点
+            rest = [
+                reports[u]["report_id"]
+                for u in comp_nodes[comp_id[ap]]
+                if u != ap and marker[u] != ap
+            ]
+            if rest:
+                groups.append(sorted(rest))
+        groups.sort()
         if len(groups) >= 2:  # 至少两个非空组才算桥接；叶子点移除后只剩一组，排除
-            result.append({"report_id": ap, "groups": groups})
+            result.append({"report_id": reports[ap]["report_id"], "groups": groups})
     return result

@@ -21,6 +21,7 @@ def create_app(db_path: str) -> FastAPI:
     db.init_db(db_path)
 
     app = FastAPI(title="道路巡检桥接上报复核")
+    app.state.db_path = db_path
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
     def index_context(error: str | None = None, msg: str | None = None) -> dict:
@@ -68,11 +69,16 @@ def create_app(db_path: str) -> FastAPI:
         msg = f"上传成功：{len(rows)} 行已提交（批次 {upload_id[:8]}）"
         return RedirectResponse(f"/?{urlencode({'msg': msg})}", status_code=303)
 
-    @app.get("/segments/{segment_id}", response_class=HTMLResponse)
-    def segment_page(request: Request, segment_id: str):
+    def segment_snapshot(segment_id: str) -> tuple[list[dict], list[dict]]:
+        """两个查询入口（网页/API）共用：单一只读事务取当前生效快照，再在
+        O(V) 内存的网格引擎上计算桥接。结论与分裂证据来自同一份已提交数据。"""
         reports = db.get_effective_reports(db_path, segment_id)
         active = [r for r in reports if not r["withdrawn"]]
-        bridges = core.find_bridges(active)
+        return reports, core.find_bridges(active)
+
+    @app.get("/segments/{segment_id}", response_class=HTMLResponse)
+    def segment_page(request: Request, segment_id: str):
+        reports, bridges = segment_snapshot(segment_id)
         return templates.TemplateResponse(
             request,
             "segment.html",
@@ -91,12 +97,12 @@ def create_app(db_path: str) -> FastAPI:
 
     @app.get("/api/segments/{segment_id}/bridges")
     def api_bridges(segment_id: str):
-        reports = db.get_effective_reports(db_path, segment_id)
+        reports, bridges = segment_snapshot(segment_id)
         active = [r for r in reports if not r["withdrawn"]]
         return {
             "segment_id": segment_id,
             "active_reports": sorted(r["report_id"] for r in active),
-            "bridges": core.find_bridges(active),
+            "bridges": bridges,
         }
 
     return app

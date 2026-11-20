@@ -1,4 +1,4 @@
-"""关键自测：桥接判定、修订语义、上传原子性、重启持久化、交错一致性。"""
+"""关键自测：桥接判定、修订语义、上传原子性、重启持久化、交错一致性、密集大图内存。"""
 import threading
 
 import pytest
@@ -15,6 +15,28 @@ CHAIN = [
     ("B", 0, "S1", 4, 0, "2026-11-19T10:05:00Z", 0),
     ("C", 0, "S1", 8, 0, "2026-11-19T10:10:00Z", 0),
 ]
+
+# 密集路段参数：两片各 N 条、片内两两相连（真团），仅由一条桥接 Z 相连
+DENSE_N = 3000
+DENSE_SIDE = 55  # ceil(sqrt(3000))
+DENSE_STEP = 0.06  # 片内最大对角距离 sqrt(2)*54*0.06 ≈ 4.58m <= 5m
+DENSE_RIGHT_X = 9.0  # 两片间距 >= 5.76m，片间没有边
+DENSE_Z_X = 4.5  # Z 距两片最近点均为 4.5m
+
+
+def dense_csv(n_per_side=DENSE_N, withdrawn_z=False, z_revision=0, segment="DENSE"):
+    """构造密集路段 CSV：左/右两片团 + 桥接 Z（可指定 Z 的修订/撤回状态）。"""
+    rows = [HEADER]
+    for i in range(n_per_side):
+        gx, gy = i % DENSE_SIDE, i // DENSE_SIDE
+        rows.append(f"L{i:04d},0,{segment},{gx*DENSE_STEP},{gy*DENSE_STEP},2026-11-19T10:00:00Z,0")
+    for i in range(n_per_side):
+        gx, gy = i % DENSE_SIDE, i // DENSE_SIDE
+        rows.append(
+            f"R{i:04d},0,{segment},{DENSE_RIGHT_X+gx*DENSE_STEP},{gy*DENSE_STEP},2026-11-19T10:00:00Z,0"
+        )
+    rows.append(f"Z,{z_revision},{segment},{DENSE_Z_X},0,2026-11-19T10:00:00Z,{1 if withdrawn_z else 0}")
+    return "\n".join(rows) + "\n"
 
 
 def make_csv(rows, header=HEADER):
@@ -318,3 +340,128 @@ def test_parse_rejects_bad_input():
         core.parse_csv(make_csv([("A", 0, "S1", 0, 0, "2026-11-19T10:00:00Z", "maybe")]))
     with pytest.raises(core.CsvError):  # 同文件内重复 上报号+修订号
         core.parse_csv(make_csv([CHAIN[0], CHAIN[0]]))
+
+
+# ---------------------------------------------------------------- 密集大图（内存上限场景）
+
+
+def _expected_dense_bridge(n_per_side=DENSE_N):
+    return {
+        "report_id": "Z",
+        "groups": [
+            sorted(f"L{i:04d}" for i in range(n_per_side)),
+            sorted(f"R{i:04d}" for i in range(n_per_side)),
+        ],
+    }
+
+
+@pytest.mark.timeout_sensitive
+def test_dense_segment_api_and_page_list_full_groups(client):
+    """两片各 3000 条、片内两两相连，仅 Z 桥接：API 与网页都要给出 Z 和两组完整名单。"""
+    r = post(client, dense_csv())
+    assert r.status_code == 200
+
+    data = get_bridges(client, "DENSE")
+    assert len(data["active_reports"]) == 2 * DENSE_N + 1
+    assert data["bridges"] == [_expected_dense_bridge()]
+
+    html = client.get("/segments/DENSE").text
+    assert "疑似桥接上报（1 条）" in html
+    assert "⭐ 上报号 Z" in html
+    assert "分裂为 2 个非空组" in html
+    # 两组完整名单都在页面上（抽首/尾各一个，加上成员计数由 API 断言保证）
+    assert "L0000" in html and f"L{DENSE_N-1:04d}" in html
+    assert "R0000" in html and f"R{DENSE_N-1:04d}" in html
+
+
+@pytest.mark.timeout_sensitive
+def test_dense_segment_concurrent_web_and_api(client):
+    """网页与 API 同时查询同一密集路段：两路都成功且结论一致，不报错。"""
+    post(client, dense_csv())
+    box = {}
+
+    def call_api():
+        box["api"] = client.get("/api/segments/DENSE/bridges")
+
+    def call_page():
+        box["page"] = client.get("/segments/DENSE")
+
+    threads = [threading.Thread(target=call_api), threading.Thread(target=call_page)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert box["api"].status_code == 200
+    assert box["page"].status_code == 200
+    assert box["api"].json()["bridges"] == [_expected_dense_bridge()]
+    assert "⭐ 上报号 Z" in box["page"].text
+
+
+@pytest.mark.timeout_sensitive
+def test_dense_segment_correction_and_withdrawal(client):
+    """密集路段补传：撤回 Z 后无桥接；再补更正（高修订恢复位置）后桥接与两组名单恢复。"""
+    post(client, dense_csv())
+    assert get_bridges(client, "DENSE")["bridges"] == [_expected_dense_bridge()]
+
+    # 补传撤回：Z 高修订 withdrawn=1，两片彻底断开，不再有桥接
+    post(client, dense_csv(withdrawn_z=True, z_revision=1))
+    data = get_bridges(client, "DENSE")
+    assert data["active_reports"] == sorted(
+        [f"L{i:04d}" for i in range(DENSE_N)] + [f"R{i:04d}" for i in range(DENSE_N)]
+    )
+    assert data["bridges"] == []
+
+    # 再补更正：rev2 把 Z 放回原位置且未撤回，结论按最新上报恢复
+    post(client, dense_csv(z_revision=2))
+    assert get_bridges(client, "DENSE")["bridges"] == [_expected_dense_bridge()]
+
+
+@pytest.mark.timeout_sensitive
+def test_dense_queries_interleaved_with_supplement(client):
+    """补传与查询交错：补传前已读到旧快照的查询给出旧分裂证据，补传后的查询按新数据。"""
+    post(client, dense_csv())
+
+    started = threading.Event()
+    release = threading.Event()
+    box = {}
+
+    def slow_query():
+        # 先在旧快照上把有效报读取出来（模拟“已读到旧数据”的在途查询），
+        # 等待补传提交后再计算，结论仍必须对应旧快照
+        reports = db.get_effective_reports(client.app.state.db_path, "DENSE")
+        started.set()
+        release.wait(timeout=10)
+        active = [r for r in reports if not r["withdrawn"]]
+        box["in_flight"] = core.find_bridges(active)
+
+    t = threading.Thread(target=slow_query)
+    t.start()
+    assert started.wait(timeout=10)
+
+    # 在途查询持有旧快照期间提交撤回补传
+    post(client, dense_csv(withdrawn_z=True, z_revision=1))
+    release.set()
+    t.join()
+
+    # 旧快照查询：仍能给出 Z 的分裂证据
+    assert box["in_flight"] == [_expected_dense_bridge()]
+    # 补传后的新查询：按更新后的上报，Z 已撤回，无桥接
+    assert get_bridges(client, "DENSE")["bridges"] == []
+
+
+def test_grid_engine_is_linear_memory_on_dense_cliques():
+    """核心引擎自检：6001 节点密集图不物化 O(V^2) 边，能在受限内存下算完且结果正确。"""
+    reps = []
+    for i in range(DENSE_N):
+        gx, gy = i % DENSE_SIDE, i // DENSE_SIDE
+        reps.append({"report_id": f"L{i:04d}", "x": gx*DENSE_STEP,
+                     "y": gy*DENSE_STEP, "ts_epoch": 0.0})
+    for i in range(DENSE_N):
+        gx, gy = i % DENSE_SIDE, i // DENSE_SIDE
+        reps.append({"report_id": f"R{i:04d}", "x": DENSE_RIGHT_X+gx*DENSE_STEP,
+                     "y": gy*DENSE_STEP, "ts_epoch": 0.0})
+    reps.append({"report_id": "Z", "x": DENSE_Z_X, "y": 0.0, "ts_epoch": 0.0})
+
+    bridges = core.find_bridges(reps)
+    assert bridges == [_expected_dense_bridge()]

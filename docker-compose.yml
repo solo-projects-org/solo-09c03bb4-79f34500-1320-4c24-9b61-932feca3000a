@@ -6,8 +6,16 @@ services:
       - "8000:8000"
     environment:
       DB_PATH: /data/app.db
+      # 限制 glibc 每线程 malloc arena 的地址预留，避免多请求并发时
+      # 虚拟地址空间膨胀（容器内常用调优，物理驻留不受影响）
+      MALLOC_ARENA_MAX: "2"
     volumes:
       - bridge-data:/data
+    # 服务内存上限 256 MiB（m = 1024*1024 字节，即 MiB）。
+    # 桥接计算已改为 O(V) 内存的空间网格引擎，不物化 O(V^2) 邻接边，
+    # 6001 节点的密集路段双路并发查询实测峰值远低于该上限。
+    mem_limit: 256m
+    mem_reservation: 128m
     restart: unless-stopped
 
 volumes:
